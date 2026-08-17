@@ -10,6 +10,7 @@ const NOTION_TOKEN = process.env.NOTION_TOKEN;
 const NOTION_GUESTS_DB_ID = '35173a7166368022bf60d76141cca681'; // Карточка Гостя
 const NOTION_VISITS_DB_ID = 'f384e676a0d7477bb45a34707bcb0dff'; // Визиты
 const NOTION_PROBLEMS_DB_ID = '88be90a6768e4c9da2819565e1a69f62'; // Проблемы
+const NOTION_REVIEWS_DB_ID = '994a20a76308436683487de6593747f'; // Отзывы CSI (заполняется гостевым приложением)
 const NOTION_EVENTS_DB_ID = '35173a71663680999ebcf882ecea022d'; // Журнал Мероприятий
 const NOTION_GENERAL_GUESTS_DB_ID = 'f25cd3eb7e8441f2ada6bdd20700c4d6'; // Общая база гостей (из гостевого мини-аппа)
 const NOTION_EMPLOYEES_DB_ID = '56fb72e9a9244998828c1d8d3cb9b381'; // Сотрудники — именные PIN-коды
@@ -873,7 +874,9 @@ app.get('/api/staff/problems', async (req, res) => {
 app.post('/api/staff/problem/:id/take', async (req, res) => {
   if (!(await checkPin(req, res))) return;
   const rootCause = (req.body?.rootCause || '').trim();
+  const deadline = (req.body?.deadline || '').trim();
   if (!rootCause) return res.status(400).json({ error: 'Нужно указать коренную причину, прежде чем взять в работу' });
+  if (!deadline) return res.status(400).json({ error: 'Нужно указать срок исполнения, прежде чем взять в работу' });
 
   try {
     const pageRes = await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, { headers: NOTION_HEADERS });
@@ -891,7 +894,8 @@ app.post('/api/staff/problem/:id/take', async (req, res) => {
       body: JSON.stringify({
         properties: {
           'Статус': { select: { name: 'В работе' } },
-          'Корневая причина': { rich_text: [{ text: { content: rootCause } }] }
+          'Корневая причина': { rich_text: [{ text: { content: rootCause } }] },
+          'Срок исполнения': { date: { start: deadline } }
         }
       })
     });
@@ -932,15 +936,19 @@ app.post('/api/staff/problem/:id/resolve', async (req, res) => {
 app.post('/api/staff/problem/:id/reassign', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
   const role = (req.body?.role || '').trim();
+  const deadline = (req.body?.deadline || '').trim();
   if (!ASSIGNABLE_ROLES.includes(role)) {
     return res.status(400).json({ error: 'Неизвестная роль' });
   }
+
+  const properties = { 'Ответственный': { rich_text: [{ text: { content: role } }] } };
+  if (deadline) properties['Срок исполнения'] = { date: { start: deadline } };
 
   try {
     await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
       method: 'PATCH',
       headers: NOTION_HEADERS,
-      body: JSON.stringify({ properties: { 'Ответственный': { rich_text: [{ text: { content: role } }] } } })
+      body: JSON.stringify({ properties })
     });
     res.json({ ok: true });
   } catch (error) {
@@ -1044,8 +1052,9 @@ app.post('/api/admin/events', async (req, res) => {
 });
 
 // ─── АДМИН: СТАТИСТИКА (CSI/NPS, eNPS, визиты) ─────
+// CSI/NPS теперь читаются из Notion "Отзывы CSI" (см. NOTION_REVIEWS_DB_ID выше).
+// eNPS пока остаётся в Google-таблице — её мы не трогали.
 
-const CSI_SHEETS_ID = '1SOKanELXstuJ0W75fsWpbmYRibk-mWkHLF5XHz4KHYc';
 const ENPS_SHEETS_ID = '1nKMCWGXsdQ-3KgMeFtPkIlmKlim4Ae6YFT-jEnZnLwY';
 
 function parseCsv(text) {
@@ -1103,24 +1112,31 @@ app.get('/api/admin/stats', async (req, res) => {
     visits: null
   };
 
-  // ── CSI + NPS гостей ──
+  // ── CSI + NPS гостей — теперь из Notion "Отзывы CSI" (раньше была Google-таблица) ──
   try {
-    const rows = await fetchSheetCsv(CSI_SHEETS_ID);
-    const dataRows = rows.slice(1).filter(r => isThisMonth(r[0]));
-    if (dataRows.length) {
-      const col = i => dataRows.map(r => parseFloat(r[i]));
-      const nps = col(6).filter(n => !isNaN(n));
+    const monthStart = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-01`;
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_REVIEWS_DB_ID}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ filter: { property: 'Дата', date: { on_or_after: monthStart } } })
+    });
+    const data = await r.json();
+    const reviews = data.results || [];
+
+    if (reviews.length) {
+      const col = (name) => reviews.map(p => p.properties[name]?.number).filter(n => typeof n === 'number');
+      const nps = col('NPS');
       const promoters = nps.filter(n => n >= 9).length;
       const detractors = nps.filter(n => n <= 6).length;
       const npsScore = nps.length ? Math.round(((promoters - detractors) / nps.length) * 100) : null;
 
       result.csi = {
-        count: dataRows.length,
-        vecher: avg(col(1)),
-        kalyan: avg(col(2)),
-        napitki: avg(col(3)),
-        eda: avg(col(4)),
-        komanda: avg(col(5)),
+        count: reviews.length,
+        vecher: avg(col('Вечер')),
+        kalyan: avg(col('Кальян')),
+        napitki: avg(col('Напитки')),
+        eda: avg(col('Еда')),
+        komanda: avg(col('Команда')),
         nps: npsScore
       };
     }
