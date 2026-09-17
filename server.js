@@ -1168,41 +1168,35 @@ app.delete('/api/admin/events/:id', async (req, res) => {
 });
 
 // ─── ГРАФИК СМЕН (замена Supershift) ────────────────
-// Видит весь график любой сотрудник с PIN (чтобы понимать кто когда выходит),
-// а редактирует — только администратор. Одна запись = один сотрудник на одну дату.
+// Видит весь график вся команда (кто с кем работает), а редактирует —
+// только администратор. Одна запись = один сотрудник на одну дату.
 
-// Список сотрудников — нужен только администратору, для выбора при назначении смены.
-// Обычный сотрудник видит только свой график и не должен видеть список чужих имён.
+// Список сотрудников — нужен всем, чтобы подписывать чужие смены в календаре,
+// и админу отдельно — для выбора при назначении смены.
 app.get('/api/staff/employees-list', async (req, res) => {
-  if (!(await checkAdminPin(req, res))) return;
+  if (!(await checkPin(req, res))) return;
   await ensureEmployeesFresh();
   res.json(employeesCache.map(e => ({ id: e.id, name: e.name, role: e.role })));
 });
 
-// Смены за период (месяц для календаря). Администратор видит всю команду,
-// обычный сотрудник — фильтр на смены применяется прямо в запросе к Notion,
-// так что чужие данные физически не покидают Notion и не долетают до клиента.
+// Смены за период (месяц для календаря) — вся команда видит всех.
 app.get('/api/staff/schedule', async (req, res) => {
   if (!(await checkPin(req, res))) return;
   const from = req.query.from;
   const to = req.query.to;
   if (!from || !to) return res.status(400).json({ error: 'from and to required' });
 
-  const isAdmin = req.employee.role === 'Администратор';
-  const dateFilters = [
-    { property: 'Дата', date: { on_or_after: from } },
-    { property: 'Дата', date: { on_or_before: to } }
-  ];
-  if (!isAdmin) {
-    dateFilters.push({ property: 'Сотрудник', relation: { contains: req.employee.id } });
-  }
-
   try {
     const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_SCHEDULE_DB_ID}/query`, {
       method: 'POST',
       headers: NOTION_HEADERS,
       body: JSON.stringify({
-        filter: { and: dateFilters },
+        filter: {
+          and: [
+            { property: 'Дата', date: { on_or_after: from } },
+            { property: 'Дата', date: { on_or_before: to } }
+          ]
+        },
         sorts: [{ property: 'Дата', direction: 'ascending' }]
       })
     });
