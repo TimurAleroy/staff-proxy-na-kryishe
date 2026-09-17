@@ -23,7 +23,7 @@ const NOTION_MENU_DB_ID = '4640c3e50a71422e8d61830c060f52c8'; // Меню — т
 const MENU_CATEGORY_EDIT_ROLE = {
   'Напитки': 'Бармен',
   'Еда': 'Повар',
-  'Кальян': 'Кальянщик'
+  'Кальян': 'КМ'
 };
 function canEditMenuCategory(employeeRole, category) {
   return employeeRole === 'Администратор' || MENU_CATEGORY_EDIT_ROLE[category] === employeeRole;
@@ -851,7 +851,7 @@ const CATEGORY_ROLE_MAP = {
   'Команда': 'Администратор',
   'Общее': 'Администратор'
 };
-const ASSIGNABLE_ROLES = ['Кальянщик', 'Бармен', 'Повар', 'Официант', 'Администратор'];
+const ASSIGNABLE_ROLES = ['КМ', 'Бармен', 'Повар', 'Официант', 'Администратор'];
 
 function defaultDeadline(severity) {
   const days = severity === 'Высокая' ? 3 : 7;
@@ -1294,11 +1294,16 @@ app.post('/api/admin/schedule', async (req, res) => {
 app.delete('/api/admin/schedule/:id', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
   try {
-    await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
+    const patchRes = await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
       method: 'PATCH',
       headers: NOTION_HEADERS,
       body: JSON.stringify({ archived: true })
     });
+    const patchData = await patchRes.json();
+    if (!patchRes.ok) {
+      console.error('Notion delete failed (schedule):', patchData);
+      return res.status(502).json({ error: patchData?.message || 'Notion отклонил удаление смены' });
+    }
     res.json({ ok: true });
   } catch (error) {
     console.error(error);
