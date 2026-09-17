@@ -1558,6 +1558,141 @@ app.get('/api/admin/stats', async (req, res) => {
   res.json(result);
 });
 
+// ─── ДЕСКТОП: НЕДЕЛЬНАЯ ДИНАМИКА (CSI/NPS/eNPS/визиты) ─
+// Для графика и сравнения "эта неделя vs прошлая" на десктопной панели.
+// Неделя считается с понедельника — так же, как в графике смен.
+app.get('/api/admin/stats-weekly', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const WEEKS_BACK = 8;
+
+  function weekMonday(dateStr) {
+    const d = new Date(dateStr);
+    const day = (d.getDay() + 6) % 7; // 0 = Пн
+    d.setDate(d.getDate() - day);
+    return d.toISOString().split('T')[0];
+  }
+  function npsFromVals(vals) {
+    if (!vals.length) return null;
+    const promoters = vals.filter(n => n >= 9).length;
+    const detractors = vals.filter(n => n <= 6).length;
+    return Math.round(((promoters - detractors) / vals.length) * 100);
+  }
+
+  try {
+    const since = new Date();
+    since.setDate(since.getDate() - WEEKS_BACK * 7);
+    const sinceISO = since.toISOString().split('T')[0];
+
+    const [reviewsRes, enpsRes, visitsRes] = await Promise.all([
+      fetch(`https://api.notion.com/v1/databases/${NOTION_REVIEWS_DB_ID}/query`, {
+        method: 'POST', headers: NOTION_HEADERS,
+        body: JSON.stringify({ filter: { property: 'Дата', date: { on_or_after: sinceISO } }, page_size: 100 })
+      }),
+      fetch(`https://api.notion.com/v1/databases/${NOTION_ENPS_DB_ID}/query`, {
+        method: 'POST', headers: NOTION_HEADERS,
+        body: JSON.stringify({ filter: { property: 'Дата', date: { on_or_after: sinceISO } }, page_size: 100 })
+      }),
+      fetch(`https://api.notion.com/v1/databases/${NOTION_VISITS_DB_ID}/query`, {
+        method: 'POST', headers: NOTION_HEADERS,
+        body: JSON.stringify({ filter: { property: 'Дата', date: { on_or_after: sinceISO } }, page_size: 100 })
+      })
+    ]);
+    const reviews = (await reviewsRes.json()).results || [];
+    const enpsEntries = (await enpsRes.json()).results || [];
+    const visits = (await visitsRes.json()).results || [];
+
+    const buckets = {};
+    const ensure = (wk) => buckets[wk] || (buckets[wk] = { csiSum: 0, csiCount: 0, npsVals: [], enpsVals: [], visits: 0 });
+
+    for (const p of reviews) {
+      const date = p.properties['Дата']?.date?.start;
+      if (!date) continue;
+      const b = ensure(weekMonday(date));
+      const cats = ['Вечер', 'Кальян', 'Напитки', 'Еда', 'Команда']
+        .map(k => p.properties[k]?.number).filter(n => typeof n === 'number');
+      if (cats.length) { b.csiSum += cats.reduce((a, c) => a + c, 0) / cats.length; b.csiCount++; }
+      const nps = p.properties['NPS']?.number;
+      if (typeof nps === 'number') b.npsVals.push(nps);
+    }
+    for (const p of enpsEntries) {
+      const date = p.properties['Дата']?.date?.start;
+      if (!date) continue;
+      const score = p.properties['Оценка']?.number;
+      if (typeof score === 'number') ensure(weekMonday(date)).enpsVals.push(score);
+    }
+    for (const v of visits) {
+      const date = v.properties['Дата']?.date?.start;
+      if (date) ensure(weekMonday(date)).visits++;
+    }
+
+    const series = Object.keys(buckets).sort().map(wk => {
+      const b = buckets[wk];
+      return {
+        week: wk,
+        csi: b.csiCount ? Math.round((b.csiSum / b.csiCount) * 10) / 10 : null,
+        nps: npsFromVals(b.npsVals),
+        enps: npsFromVals(b.enpsVals),
+        visits: b.visits
+      };
+    });
+
+    res.json({ weeks: series });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch weekly stats' });
+  }
+});
+
+// ─── ДЕСКТОП: ЕДИНАЯ ТАБЛИЦА ГОСТЕЙ (с RFM-меткой) ──────
+// Объединяет то, что на мобильном разнесено по отдельным карточкам
+// (Недавние/VIP/Давно не было), в одну таблицу с фильтрами на клиенте.
+app.get('/api/admin/guests-table', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+
+  try {
+    const guestsRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_GUESTS_DB_ID}/query`, {
+      method: 'POST', headers: NOTION_HEADERS,
+      body: JSON.stringify({ sorts: [{ property: 'Имя Гостя', direction: 'ascending' }], page_size: 100 })
+    });
+    const guests = (await guestsRes.json()).results || [];
+
+    const visitsRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_VISITS_DB_ID}/query`, {
+      method: 'POST', headers: NOTION_HEADERS,
+      body: JSON.stringify({ sorts: [{ property: 'Дата', direction: 'descending' }], page_size: 100 })
+    });
+    const visitsData = await visitsRes.json();
+    const lastVisitByGuest = {};
+    for (const v of visitsData.results || []) {
+      const guestId = v.properties['Гость']?.relation?.[0]?.id;
+      const date = v.properties['Дата']?.date?.start;
+      if (guestId && date && !lastVisitByGuest[guestId]) lastVisitByGuest[guestId] = date;
+    }
+
+    const now = new Date();
+    const rows = guests.map(g => {
+      const lastVisit = lastVisitByGuest[g.id] || null;
+      const daysSince = lastVisit ? Math.floor((now - new Date(lastVisit)) / (1000 * 60 * 60 * 24)) : null;
+      const status = g.properties['Частота визитов']?.select?.name || '';
+      // Риск оттока — только для тех, кого мы обычно ждём регулярно (VIP/Постоянный)
+      const atRisk = (status === 'VIP' || status === 'Постоянный') && (daysSince === null || daysSince >= 30);
+      return {
+        id: g.id,
+        name: g.properties['Имя Гостя']?.title?.[0]?.plain_text || '',
+        phone: g.properties['Телефон']?.phone_number || '',
+        status,
+        lastVisit,
+        daysSince,
+        atRisk
+      };
+    });
+
+    res.json(rows);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch guests table' });
+  }
+});
+
 app.get('/', (req, res) => {
   res.send('Staff Proxy for На Крыше is running ✅');
 });
