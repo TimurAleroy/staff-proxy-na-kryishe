@@ -1326,6 +1326,7 @@ app.get('/api/staff/menu', async (req, res) => {
       body: JSON.stringify({
         sorts: [
           { property: 'Категория', direction: 'ascending' },
+          { property: 'Подкатегория', direction: 'ascending' },
           { property: 'Порядок', direction: 'ascending' }
         ]
       })
@@ -1341,6 +1342,7 @@ app.get('/api/staff/menu', async (req, res) => {
         id: p.id,
         name: props['Название']?.title?.[0]?.plain_text || '',
         category: props['Категория']?.select?.name || '',
+        subcategory: props['Подкатегория']?.select?.name || '',
         price: props['Цена']?.number ?? null,
         available: props['В наличии']?.checkbox === true
       };
