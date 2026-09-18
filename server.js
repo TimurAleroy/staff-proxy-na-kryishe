@@ -1271,6 +1271,167 @@ app.delete('/api/admin/events/:id', async (req, res) => {
   }
 });
 
+// ─── БРОНИ (единый список — из бота и с сайта) ──────
+// Отдельной базы броней нет: каждая бронь — запись в текстовом поле
+// «История броней» гостя в общей базе контактов (та же, что использует бот
+// бронирования и сайт). Формат записи:
+// "ISO-дата|текст|тип|uid|гостей|комментарий" + суффикс " (подтверждено)" / " (отменено)".
+//
+// Подтверждение/отмена/перенос сами по себе пишутся не здесь, а в
+// notion-proxy-na-kryishe (у него бот, которым можно написать гостю) — этот
+// файл только читает общий источник и, когда админ жмёт кнопку в панели,
+// просит notion-proxy выполнить действие через внутренний эндпоинт
+// (см. callGuestProxy ниже). Так гость получает то же автосообщение,
+// что и при подтверждении через кнопку в Telegram, откуда бы админ ни нажал.
+
+function stripBookingSuffix(raw) {
+  return raw.replace(' (подтверждено)', '').replace(' (отменено)', '');
+}
+function parseBookingEntry(raw) {
+  const clean = stripBookingSuffix(raw);
+  const parts = clean.split('|');
+  if (parts.length === 1) {
+    return { iso: null, display: parts[0], kind: 'table', uid: null, guests: null, comment: '' };
+  }
+  return {
+    iso: parts[0] || null,
+    display: parts[1] || '',
+    kind: parts[2] || 'table',
+    uid: parts[3] || null,
+    guests: parts[4] ? (Number(parts[4]) || null) : null,
+    comment: parts[5] || ''
+  };
+}
+function isBookingExpired(iso) {
+  if (!iso) return true; // старые записи без даты считаем прошедшими
+  return iso.slice(0, 10) < venueDateStr();
+}
+
+// Видит только администратор.
+app.get('/api/staff/bookings', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    let allResults = [];
+    let cursor;
+    do {
+      const body = { page_size: 100 };
+      if (cursor) body.start_cursor = cursor;
+      const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_GENERAL_GUESTS_DB_ID}/query`, {
+        method: 'POST',
+        headers: NOTION_HEADERS,
+        body: JSON.stringify(body)
+      });
+      if (!r.ok) return res.status(502).json({ error: 'Notion query failed' });
+      const data = await r.json();
+      allResults = allResults.concat(data.results || []);
+      cursor = data.has_more ? data.next_cursor : undefined;
+    } while (cursor);
+
+    const bookings = [];
+    for (const page of allResults) {
+      const props = page.properties;
+      const name = props['Имя']?.title?.[0]?.plain_text || 'Гость';
+      const phone = props['Телефон']?.phone_number || '';
+      const history = props['История броней']?.rich_text?.[0]?.plain_text || '';
+      if (!history) continue;
+
+      const entries = history.split(',').map(s => s.trim()).filter(Boolean);
+      for (const raw of entries) {
+        if (raw.includes('(отменено)')) continue;
+        const confirmed = raw.includes('(подтверждено)');
+        const { iso, display, kind, guests, comment } = parseBookingEntry(raw);
+        if (isBookingExpired(iso)) continue;
+
+        let kindLabel = 'Стол';
+        let eventName = null;
+        if (kind === 'vip') kindLabel = 'VIP-комната';
+        else if (kind && kind.startsWith('event:')) { kindLabel = 'Мероприятие'; eventName = kind.slice(6); }
+
+        // entry — стрипнутая (без суффикса) исходная запись, ей же панель ссылается
+        // на конкретную бронь при подтверждении/отмене/переносе — как опаковый токен.
+        bookings.push({
+          name, phone, iso, display, guests, comment,
+          status: confirmed ? 'confirmed' : 'pending',
+          kind: kindLabel, eventName,
+          entry: stripBookingSuffix(raw)
+        });
+      }
+    }
+
+    bookings.sort((a, b) => (a.iso || '').localeCompare(b.iso || ''));
+    res.json(bookings);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch bookings' });
+  }
+});
+
+// ─── ДЕЙСТВИЯ НАД БРОНЬЮ (подтвердить / отменить / перенести) ──
+// Сам этот сервис в Notion для этих действий не пишет — просит сделать это
+// notion-proxy-na-kryishe через внутренний эндпоинт (у него бот, которым можно
+// написать гостю; у стаф-бота — другого — такой возможности нет).
+// Несколько попыток на случай временной недоступности; если совсем не достучались —
+// честно возвращаем ошибку, а не тихий "успех" без реального результата.
+
+const GUEST_PROXY_BASE = process.env.GUEST_PROXY_BASE || 'https://notion-proxy-na-kryishe-production.up.railway.app';
+const INTERNAL_ADMIN_KEY = process.env.INTERNAL_ADMIN_KEY;
+
+async function callGuestProxy(path, payload) {
+  if (!INTERNAL_ADMIN_KEY) return { reached: false, reason: 'no_key' };
+  const attempts = 3;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const r = await fetch(`${GUEST_PROXY_BASE}${path}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-internal-key': INTERNAL_ADMIN_KEY },
+        body: JSON.stringify(payload)
+      });
+      const data = await r.json().catch(() => ({}));
+      if (r.ok) return { reached: true, ...data };
+      if (r.status < 500) return { reached: true, httpError: r.status, ...data }; // не временная ошибка — ретраить бессмысленно
+    } catch (e) {
+      // сетевая проблема — пробуем ещё раз
+    }
+    if (i < attempts - 1) await new Promise(r2 => setTimeout(r2, 400 * (i + 1)));
+  }
+  return { reached: false, reason: 'unreachable' };
+}
+
+app.post('/api/staff/bookings/confirm', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const { phone, entry } = req.body;
+  if (!phone || !entry) return res.status(400).json({ error: 'phone and entry required' });
+
+  const result = await callGuestProxy('/api/internal/booking/confirm', { phone, entry });
+  if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
+  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  res.json({ ok: true, notified: !!result.notified });
+});
+
+app.post('/api/staff/bookings/cancel', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const { phone, entry, message } = req.body;
+  if (!phone || !entry) return res.status(400).json({ error: 'phone and entry required' });
+
+  const result = await callGuestProxy('/api/internal/booking/cancel', { phone, entry, message });
+  if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
+  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  res.json({ ok: true, notified: !!result.notified });
+});
+
+app.post('/api/staff/bookings/edit', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const { phone, entry, dateISO, time, guests, comment } = req.body;
+  if (!phone || !entry || !dateISO || !time) {
+    return res.status(400).json({ error: 'phone, entry, dateISO and time required' });
+  }
+
+  const result = await callGuestProxy('/api/internal/booking/edit', { phone, entry, dateISO, time, guests, comment });
+  if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
+  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  res.json({ ok: true, notified: !!result.notified, newEntry: result.newEntry, newDisplayText: result.newDisplayText });
+});
+
 // ─── ГРАФИК СМЕН (замена Supershift) ────────────────
 // Видит весь график вся команда (кто с кем работает), а редактирует —
 // только администратор. Одна запись = один сотрудник на одну дату.
