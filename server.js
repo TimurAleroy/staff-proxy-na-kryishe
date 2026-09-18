@@ -585,17 +585,22 @@ app.get('/api/staff/guest/:id', async (req, res) => {
     const guest = await guestRes.json();
     const props = guest.properties;
 
+    const phone = props['Телефон']?.phone_number || '';
+    const status = props['Частота визитов']?.select?.name || '';
+
+    // Расширенный запрос визитов (до 50) — нужен и для списка "последние визиты",
+    // и для расчёта риска оттока, и для подсчёта частоты кальянов (любимая позиция)
     const visitsRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_VISITS_DB_ID}/query`, {
       method: 'POST',
       headers: NOTION_HEADERS,
       body: JSON.stringify({
         filter: { property: 'Гость', relation: { contains: req.params.id } },
         sorts: [{ property: 'Дата', direction: 'descending' }],
-        page_size: 5
+        page_size: 50
       })
     });
     const visitsData = await visitsRes.json();
-    const visits = (visitsData.results || []).map(v => {
+    const allVisits = (visitsData.results || []).map(v => {
       const vp = v.properties;
       return {
         date: vp['Дата']?.date?.start || '',
@@ -603,14 +608,69 @@ app.get('/api/staff/guest/:id', async (req, res) => {
         notes: vp['Заметки']?.rich_text?.[0]?.plain_text || ''
       };
     });
+    const visits = allVisits.slice(0, 5);
+
+    // ── Автотег «Риск оттока» — та же формула, что в /api/admin/guests-table ──
+    const lastVisitDate = allVisits[0]?.date || null;
+    const daysSince = lastVisitDate
+      ? Math.floor((new Date() - new Date(lastVisitDate)) / (1000 * 60 * 60 * 24))
+      : null;
+    const atRisk = (status === 'VIP' || status === 'Постоянный') && (daysSince === null || daysSince >= 30);
+
+    // ── Автотег «Негативный отзыв» — связи Отзывы→Гость нет, ищем по телефону ──
+    let negativeReview = null;
+    if (phone) {
+      try {
+        const revRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_REVIEWS_DB_ID}/query`, {
+          method: 'POST',
+          headers: NOTION_HEADERS,
+          body: JSON.stringify({
+            filter: { property: 'Телефон', phone_number: { equals: phone } },
+            sorts: [{ property: 'Дата', direction: 'descending' }],
+            page_size: 10
+          })
+        });
+        const revData = await revRes.json();
+        const cats = ['Вечер', 'Кальян', 'Напитки', 'Еда', 'Команда'];
+        for (const r of (revData.results || [])) {
+          const rp = r.properties;
+          let worst = null, worstCat = null;
+          for (const c of cats) {
+            const v = rp[c]?.number;
+            if (typeof v === 'number' && v <= 3 && (worst === null || v < worst)) { worst = v; worstCat = c; }
+          }
+          if (worst !== null) {
+            negativeReview = { date: rp['Дата']?.date?.start || '', category: worstCat, score: worst };
+            break; // самый свежий негативный отзыв — этого достаточно для пометки
+          }
+        }
+      } catch (e) { console.error('Negative review check failed:', e); }
+    }
+
+    // ── Любимая позиция — самый частый вкус кальяна среди всех визитов ──
+    const hookahCounts = {};
+    let visitsWithHookah = 0;
+    for (const v of allVisits) {
+      const flavor = (v.hookah || '').trim();
+      if (!flavor) continue;
+      visitsWithHookah++;
+      const key = flavor.toLowerCase();
+      if (!hookahCounts[key]) hookahCounts[key] = { name: flavor, count: 0 };
+      hookahCounts[key].count++;
+    }
+    const topHookah = Object.values(hookahCounts).sort((a, b) => b.count - a.count)[0] || null;
 
     res.json({
       id: guest.id,
       name: props['Имя Гостя']?.title?.[0]?.plain_text || '',
-      status: props['Частота визитов']?.select?.name || '',
+      status,
       birthday: props['Дата рождения']?.date?.start || null,
-      phone: props['Телефон']?.phone_number || '',
+      phone,
       important: props['Что важно для гостя']?.rich_text?.[0]?.plain_text || '',
+      tagsSpecial: (props['Теги (особые)']?.multi_select || []).map(o => o.name),
+      tagsAllergy: (props['Теги (аллергии)']?.multi_select || []).map(o => o.name),
+      autoTags: { atRisk, daysSince, negativeReview },
+      favorites: { hookah: topHookah, visitsWithHookah, totalVisits: allVisits.length },
       visits
     });
   } catch (error) {
@@ -642,6 +702,50 @@ app.patch('/api/staff/guest/:id', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Update failed' });
+  }
+});
+
+// ─── РУЧНЫЕ ТЕГИ (Особые / Аллергии) — добавление и удаление по одному ──
+
+const TAG_GROUP_PROPERTY = {
+  special: 'Теги (особые)',
+  allergy: 'Теги (аллергии)'
+};
+
+app.post('/api/staff/guest/:id/tag', async (req, res) => {
+  if (!(await checkPin(req, res))) return;
+  const { group, tag, action } = req.body;
+  const propName = TAG_GROUP_PROPERTY[group];
+  const tagName = (tag || '').trim();
+
+  if (!propName || !tagName || !['add', 'remove'].includes(action)) {
+    return res.status(400).json({ error: 'bad request' });
+  }
+
+  try {
+    const pageRes = await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, { headers: NOTION_HEADERS });
+    if (!pageRes.ok) return res.status(502).json({ error: 'Failed to read guest' });
+    const page = await pageRes.json();
+    const current = (page.properties[propName]?.multi_select || []).map(o => o.name);
+
+    const next = action === 'add'
+      ? (current.includes(tagName) ? current : [...current, tagName])
+      : current.filter(t => t !== tagName);
+
+    const upRes = await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
+      method: 'PATCH',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ properties: { [propName]: { multi_select: next.map(name => ({ name })) } } })
+    });
+    if (!upRes.ok) {
+      console.error('Tag update failed:', await upRes.text());
+      return res.status(502).json({ error: 'Notion update failed' });
+    }
+
+    res.json({ ok: true, tags: next });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to update tag' });
   }
 });
 
