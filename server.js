@@ -679,6 +679,64 @@ app.get('/api/staff/guest/:id', async (req, res) => {
   }
 });
 
+// ─── ФОТО ГОСТЯ ИЗ TELEGRAM ─────────────────────────
+// В "Карточке Гостя" (CRM) Telegram ID не хранится — его пишет гостевой мини-апп
+// в "Общую базу гостей" при бронировании/заполнении профиля. Поэтому сначала находим
+// гостя там же по телефону, а дальше — обычный Bot API: getUserProfilePhotos → getFile.
+// Ссылка от Telegram живёт около часа, поэтому недолго кэшируем её в памяти,
+// чтобы не дёргать Bot API на каждое открытие одной и той же карточки подряд.
+
+const guestPhotoCache = new Map(); // telegramId -> { url, expiresAt }
+const GUEST_PHOTO_CACHE_TTL = 45 * 60 * 1000; // 45 минут
+
+async function fetchTelegramPhotoUrl(telegramId) {
+  if (!telegramId || !TELEGRAM_BOT_TOKEN) return null;
+
+  const cached = guestPhotoCache.get(telegramId);
+  if (cached && cached.expiresAt > Date.now()) return cached.url;
+
+  const photos = await tgApi('getUserProfilePhotos', { user_id: telegramId, limit: 1 });
+  const firstSet = photos?.result?.photos?.[0];
+  if (!firstSet || !firstSet.length) {
+    guestPhotoCache.set(telegramId, { url: null, expiresAt: Date.now() + GUEST_PHOTO_CACHE_TTL });
+    return null;
+  }
+
+  const fileId = firstSet[firstSet.length - 1].file_id; // последний элемент — самый крупный размер
+  const fileInfo = await tgApi('getFile', { file_id: fileId });
+  const filePath = fileInfo?.result?.file_path;
+  if (!filePath) return null;
+
+  const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
+  guestPhotoCache.set(telegramId, { url, expiresAt: Date.now() + GUEST_PHOTO_CACHE_TTL });
+  return url;
+}
+
+app.get('/api/staff/guest/:id/photo', async (req, res) => {
+  if (!(await checkPin(req, res))) return;
+  try {
+    const guestRes = await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, { headers: NOTION_HEADERS });
+    const guest = await guestRes.json();
+    const phone = guest.properties?.['Телефон']?.phone_number || '';
+    if (!phone) return res.json({ photoUrl: null });
+
+    const genRes = await fetch(`https://api.notion.com/v1/databases/${NOTION_GENERAL_GUESTS_DB_ID}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ filter: { property: 'Телефон', phone_number: { equals: normalizePhone(phone) } } })
+    });
+    const genData = await genRes.json();
+    const telegramId = genData.results?.[0]?.properties?.['Telegram ID']?.rich_text?.[0]?.plain_text || null;
+    if (!telegramId) return res.json({ photoUrl: null });
+
+    const photoUrl = await fetchTelegramPhotoUrl(telegramId);
+    res.json({ photoUrl });
+  } catch (error) {
+    console.error('Guest photo fetch failed:', error);
+    res.json({ photoUrl: null }); // не критично — карточка просто останется с инициалами
+  }
+});
+
 // ─── РЕДАКТИРОВАНИЕ КАРТОЧКИ ───────────────────────
 
 app.patch('/api/staff/guest/:id', async (req, res) => {
