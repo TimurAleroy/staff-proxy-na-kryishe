@@ -687,18 +687,19 @@ app.get('/api/staff/guest/:id', async (req, res) => {
 // чтобы не дёргать Bot API на каждое открытие одной и той же карточки подряд.
 
 const guestPhotoCache = new Map(); // telegramId -> { url, expiresAt }
-const GUEST_PHOTO_CACHE_TTL = 45 * 60 * 1000; // 45 минут
+const GUEST_PHOTO_FOUND_TTL = 5 * 60 * 1000;  // 5 минут — чтобы смена аватарки в Telegram быстро подхватывалась
+const GUEST_PHOTO_EMPTY_TTL = 30 * 60 * 1000; // 30 минут — если фото нет вообще, не дёргаем Bot API так часто
 
-async function fetchTelegramPhotoUrl(telegramId) {
+async function fetchTelegramPhotoUrl(telegramId, force) {
   if (!telegramId || !TELEGRAM_BOT_TOKEN) return null;
 
   const cached = guestPhotoCache.get(telegramId);
-  if (cached && cached.expiresAt > Date.now()) return cached.url;
+  if (!force && cached && cached.expiresAt > Date.now()) return cached.url;
 
   const photos = await tgApi('getUserProfilePhotos', { user_id: telegramId, limit: 1 });
   const firstSet = photos?.result?.photos?.[0];
   if (!firstSet || !firstSet.length) {
-    guestPhotoCache.set(telegramId, { url: null, expiresAt: Date.now() + GUEST_PHOTO_CACHE_TTL });
+    guestPhotoCache.set(telegramId, { url: null, expiresAt: Date.now() + GUEST_PHOTO_EMPTY_TTL });
     return null;
   }
 
@@ -708,7 +709,7 @@ async function fetchTelegramPhotoUrl(telegramId) {
   if (!filePath) return null;
 
   const url = `https://api.telegram.org/file/bot${TELEGRAM_BOT_TOKEN}/${filePath}`;
-  guestPhotoCache.set(telegramId, { url, expiresAt: Date.now() + GUEST_PHOTO_CACHE_TTL });
+  guestPhotoCache.set(telegramId, { url, expiresAt: Date.now() + GUEST_PHOTO_FOUND_TTL });
   return url;
 }
 
@@ -729,7 +730,7 @@ app.get('/api/staff/guest/:id/photo', async (req, res) => {
     const telegramId = genData.results?.[0]?.properties?.['Telegram ID']?.rich_text?.[0]?.plain_text || null;
     if (!telegramId) return res.json({ photoUrl: null });
 
-    const photoUrl = await fetchTelegramPhotoUrl(telegramId);
+    const photoUrl = await fetchTelegramPhotoUrl(telegramId, req.query.force === '1');
     res.json({ photoUrl });
   } catch (error) {
     console.error('Guest photo fetch failed:', error);
