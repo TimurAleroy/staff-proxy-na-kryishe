@@ -1352,7 +1352,7 @@ function parseBookingEntry(raw) {
   const clean = stripBookingSuffix(raw);
   const parts = clean.split('|');
   if (parts.length === 1) {
-    return { iso: null, display: parts[0], kind: 'table', uid: null, guests: null, comment: '' };
+    return { iso: null, display: parts[0], kind: 'table', uid: null, guests: null, comment: '', table: '' };
   }
   return {
     iso: parts[0] || null,
@@ -1360,7 +1360,10 @@ function parseBookingEntry(raw) {
     kind: parts[2] || 'table',
     uid: parts[3] || null,
     guests: parts[4] ? (Number(parts[4]) || null) : null,
-    comment: parts[5] || ''
+    comment: parts[5] || '',
+    // Физический стол, назначенный брони персоналом — 7-е поле; у записей без
+    // назначенного стола (или у старых, ещё до этой возможности) — просто ''.
+    table: parts[6] || ''
   };
 }
 function isBookingExpired(iso) {
@@ -1400,7 +1403,7 @@ app.get('/api/staff/bookings', async (req, res) => {
       for (const raw of entries) {
         if (raw.includes('(отменено)')) continue;
         const confirmed = raw.includes('(подтверждено)');
-        const { iso, display, kind, guests, comment } = parseBookingEntry(raw);
+        const { iso, display, kind, guests, comment, table } = parseBookingEntry(raw);
         if (isBookingExpired(iso)) continue;
 
         let kindLabel = 'Стол';
@@ -1411,7 +1414,7 @@ app.get('/api/staff/bookings', async (req, res) => {
         // entry — стрипнутая (без суффикса) исходная запись, ей же панель ссылается
         // на конкретную бронь при подтверждении/отмене/переносе — как опаковый токен.
         bookings.push({
-          name, phone, iso, display, guests, comment,
+          name, phone, iso, display, guests, comment, table,
           status: confirmed ? 'confirmed' : 'pending',
           kind: kindLabel, eventName,
           entry: stripBookingSuffix(raw)
@@ -1491,6 +1494,35 @@ app.post('/api/staff/bookings/edit', async (req, res) => {
   if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
   if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
   res.json({ ok: true, notified: !!result.notified, newEntry: result.newEntry, newDisplayText: result.newDisplayText });
+});
+
+// Внести бронь вручную (гость позвонил) — сразу подтверждённая, без похода
+// гостя через мини-апп/бота. Источник в Notion помечается отдельно ("Телефон"),
+// чтобы потом можно было посчитать долю броней по каналам.
+app.post('/api/staff/bookings/add', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const { name, phone, dateISO, time, guests, comment, table } = req.body;
+  if (!name || !phone || !dateISO || !time) {
+    return res.status(400).json({ error: 'Имя, телефон, дата и время обязательны' });
+  }
+
+  const result = await callGuestProxy('/api/internal/booking/create', { name, phone, dateISO, time, guests, comment, table });
+  if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
+  if (result.httpError) return res.status(result.httpError).json({ error: result.error || 'Не удалось создать бронь' });
+  res.json({ ok: true, entry: result.entry, display: result.display });
+});
+
+// Назначить/сменить стол у брони — внутренняя пометка для персонала (не
+// уведомляет гостя и не трогает статус подтверждения).
+app.post('/api/staff/bookings/table', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const { phone, entry, table } = req.body;
+  if (!phone || !entry) return res.status(400).json({ error: 'phone and entry required' });
+
+  const result = await callGuestProxy('/api/internal/booking/table', { phone, entry, table });
+  if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
+  if (result.httpError === 404) return res.status(404).json({ error: 'Бронь не найдена' });
+  res.json({ ok: true, newEntry: result.newEntry });
 });
 
 // ─── ГРАФИК СМЕН (замена Supershift) ────────────────
