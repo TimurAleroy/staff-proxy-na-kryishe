@@ -1250,17 +1250,20 @@ app.post('/api/founder/task', async (req, res) => {
   }
 });
 
-// Список незавершённых задач — виден администратору и основателю
-// (десктопный интерфейс отдаёт их отдельным блоком рядом с "Проблемы")
+// Список задач — по умолчанию незавершённые; ?done=1 отдаёт выполненные
+// (для раздела "Показать выполненные" на экране — чтобы было видно, что
+// задача не потерялась, а реально закрыта). Видно администратору и основателю.
 app.get('/api/admin/founder-tasks', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
+  const wantDone = req.query.done === '1' || req.query.done === 'true';
   try {
     const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_TASKS_DB_ID}/query`, {
       method: 'POST',
       headers: NOTION_HEADERS,
       body: JSON.stringify({
-        filter: { property: 'Готово', checkbox: { equals: false } },
-        sorts: [{ property: 'Создано', direction: 'descending' }]
+        filter: { property: 'Готово', checkbox: { equals: wantDone } },
+        sorts: [{ property: 'Создано', direction: 'descending' }],
+        page_size: wantDone ? 20 : undefined // выполненных не грузим все подряд — только последние
       })
     });
     const data = await r.json();
