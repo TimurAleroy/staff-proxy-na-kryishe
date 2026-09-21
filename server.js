@@ -233,7 +233,7 @@ async function checkOverdueFounderTasks() {
       const title = props['Задача']?.title?.[0]?.plain_text || 'Задача';
       const deadline = props['Срок']?.date?.start || '';
 
-      await sendTelegramMessage(ADMIN_CHAT_ID, `⏰ Просрочена задача от основателя: «${title}»\nСрок был: ${deadline}\n\nОтметьте готовой или обновите срок в приложении.`);
+      await sendTelegramMessage(ADMIN_CHAT_ID, `⏰ Просрочена задача: «${title}»\nСрок был: ${deadline}\n\nОтметьте готовой или обновите срок в приложении.`);
       remindedTasksToday.add(key);
     }
   } catch (err) {
@@ -1242,7 +1242,7 @@ app.post('/api/founder/task', async (req, res) => {
       headers: NOTION_HEADERS,
       body: JSON.stringify({ parent: { database_id: NOTION_TASKS_DB_ID }, properties })
     });
-    await sendTelegramMessage(ADMIN_CHAT_ID, `📌 Новая задача от основателя: «${text}»${deadline ? `\nСрок: ${deadline}` : ''}`);
+    await sendTelegramMessage(ADMIN_CHAT_ID, `📌 Новая задача: «${text}»${deadline ? `\nСрок: ${deadline}` : ''}`);
     res.json({ ok: true });
   } catch (error) {
     console.error(error);
