@@ -1461,6 +1461,19 @@ async function callGuestProxy(path, payload) {
   return { reached: false, reason: 'unreachable' };
 }
 
+// Если entry, с которым панель ушла подтверждать/отменять/редактировать, уже
+// не совпадает с тем, что реально лежит в Notion (например, кто-то параллельно
+// назначил стол этой же брони — теперь это устранено блокировкой на стороне
+// notion-proxy, но сеть есть сеть, и бронь могли успеть поменять между тем как
+// список открыли и тем как нажали кнопку) — говорим об этом прямо, а не молчим
+// "успехом", который на деле ничего не изменил.
+function bookingActionErrorMessage(result) {
+  if (result.error === 'booking not found') {
+    return 'Эта бронь уже изменилась (например, кто-то назначил стол или сохранил другое время) — обновите список броней и попробуйте снова';
+  }
+  return 'Гость не найден';
+}
+
 app.post('/api/staff/bookings/confirm', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
   const { phone, entry } = req.body;
@@ -1468,7 +1481,7 @@ app.post('/api/staff/bookings/confirm', async (req, res) => {
 
   const result = await callGuestProxy('/api/internal/booking/confirm', { phone, entry });
   if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
-  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  if (result.httpError === 404) return res.status(404).json({ error: bookingActionErrorMessage(result) });
   res.json({ ok: true, notified: !!result.notified });
 });
 
@@ -1479,7 +1492,7 @@ app.post('/api/staff/bookings/cancel', async (req, res) => {
 
   const result = await callGuestProxy('/api/internal/booking/cancel', { phone, entry, message });
   if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
-  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  if (result.httpError === 404) return res.status(404).json({ error: bookingActionErrorMessage(result) });
   res.json({ ok: true, notified: !!result.notified });
 });
 
@@ -1492,7 +1505,7 @@ app.post('/api/staff/bookings/edit', async (req, res) => {
 
   const result = await callGuestProxy('/api/internal/booking/edit', { phone, entry, dateISO, time, guests, comment });
   if (!result.reached) return res.status(502).json({ error: 'Не удалось выполнить действие, попробуйте ещё раз' });
-  if (result.httpError === 404) return res.status(404).json({ error: 'Гость не найден' });
+  if (result.httpError === 404) return res.status(404).json({ error: bookingActionErrorMessage(result) });
   res.json({ ok: true, notified: !!result.notified, newEntry: result.newEntry, newDisplayText: result.newDisplayText });
 });
 
