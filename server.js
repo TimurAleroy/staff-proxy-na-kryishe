@@ -18,8 +18,17 @@ const NOTION_EMPLOYEES_DB_ID = '56fb72e9a9244998828c1d8d3cb9b381'; // Сотру
 const NOTION_SCHEDULE_DB_ID = '34d1765f8cd64ed0abc3838096a22066'; // График смен — замена Supershift
 const NOTION_MENU_DB_ID = '4640c3e50a71422e8d61830c060f52c8'; // Меню — тот же источник, что и в гостевом приложении
 
+// "Основатель" — роль-надстройка над "Администратор": видит и может всё то же самое
+// в десктопном интерфейсе, плюс дополнительно может ставить задачи (см. /api/founder/*
+// ниже). Везде, где раньше проверялась именно роль "Администратор" для прав, теперь
+// проверяем через isAdminRole(), чтобы основатель automatически получал тот же доступ.
+const ADMIN_ROLES = ['Администратор', 'Основатель'];
+function isAdminRole(role) {
+  return ADMIN_ROLES.includes(role);
+}
+
 // Кто может снимать/возвращать позицию своей категории с "В наличии".
-// Администратор — всегда, независимо от категории.
+// Администратор (и Основатель) — всегда, независимо от категории.
 const MENU_CATEGORY_EDIT_ROLE = {
   'Напитки': 'Бармен',
   'Коктейли': 'Бармен',
@@ -28,7 +37,7 @@ const MENU_CATEGORY_EDIT_ROLE = {
   'Кальян': 'КМ'
 };
 function canEditMenuCategory(employeeRole, category) {
-  return employeeRole === 'Администратор' || MENU_CATEGORY_EDIT_ROLE[category] === employeeRole;
+  return isAdminRole(employeeRole) || MENU_CATEGORY_EDIT_ROLE[category] === employeeRole;
 }
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const ADMIN_CHAT_ID = process.env.ADMIN_CHAT_ID || '188483198';
@@ -123,12 +132,12 @@ async function checkPin(req, res) {
   return true;
 }
 
-// Только роль "Администратор" — функции управляющего
+// Роль "Администратор" или "Основатель" — функции управляющего
 async function checkAdminPin(req, res) {
   await ensureEmployeesFresh();
   const pin = req.query.pin || req.body?.pin;
   const employee = findEmployeeByPin(pin);
-  if (!employee || employee.role !== 'Администратор') {
+  if (!employee || !isAdminRole(employee.role)) {
     res.status(403).json({ error: 'Доступно только администратору' });
     return false;
   }
@@ -218,7 +227,7 @@ app.post('/api/staff/login', async (req, res) => {
   const employee = findEmployeeByPin(pin);
   if (!employee) return res.status(401).json({ error: 'Неверный PIN-код' });
 
-  const isAdmin = employee.role === 'Администратор';
+  const isAdmin = isAdminRole(employee.role);
   res.json({ ok: true, role: isAdmin ? 'admin' : 'staff', name: employee.name, jobRole: employee.role });
 });
 
@@ -1078,7 +1087,7 @@ app.post('/api/staff/problem/:id/take', async (req, res) => {
     const responsible = page.properties['Ответственный']?.rich_text?.[0]?.plain_text || '';
     const employee = req.employee;
 
-    if (employee.role !== 'Администратор' && employee.role !== responsible) {
+    if (!isAdminRole(employee.role) && employee.role !== responsible) {
       return res.status(403).json({ error: `Взять в работу может только «${responsible}» или администратор` });
     }
 
@@ -1110,7 +1119,7 @@ app.post('/api/staff/problem/:id/resolve', async (req, res) => {
     const responsible = page.properties['Ответственный']?.rich_text?.[0]?.plain_text || '';
     const employee = req.employee;
 
-    if (employee.role !== 'Администратор' && employee.role !== responsible) {
+    if (!isAdminRole(employee.role) && employee.role !== responsible) {
       return res.status(403).json({ error: `Закрыть может только «${responsible}» или администратор` });
     }
 
@@ -1155,6 +1164,126 @@ app.post('/api/staff/problem/:id/reassign', async (req, res) => {
 app.get('/api/staff/assignable-roles', async (req, res) => {
   if (!(await checkPin(req, res))) return;
   res.json(ASSIGNABLE_ROLES);
+});
+
+// ─── ОСНОВАТЕЛЬ: ЗАДАЧИ АДМИНУ ───────────────────────
+// Отдельная лёгкая надстройка над той же базой "Проблемы" — задача от основателя
+// это обычная строка в ней (с флагом "От основателя"), поэтому переиспользует уже
+// готовые статусы (Задачи → В работе → Решена) и напоминания об просрочке
+// (см. checkOverdueProblems выше — он проверяет всю базу, включая эти строки).
+// В десктопном интерфейсе админа они показываются отдельным блоком, а не вперемешку
+// с гостевыми проблемами.
+
+// Поставить задачу может только сама роль "Основатель" — это её единственная
+// дополнительная возможность сверх обычного администратора.
+app.post('/api/founder/task', async (req, res) => {
+  if (!(await checkPin(req, res))) return;
+  const employee = req.employee;
+  if (employee.role !== 'Основатель') {
+    return res.status(403).json({ error: 'Ставить задачи может только основатель' });
+  }
+
+  const text = (req.body?.text || '').trim();
+  const severity = req.body?.severity || 'Средняя';
+  const deadline = (req.body?.deadline || '').trim() || defaultDeadline(severity);
+  if (!text) return res.status(400).json({ error: 'Укажите текст задачи' });
+
+  try {
+    await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({
+        parent: { database_id: NOTION_PROBLEMS_DB_ID },
+        properties: {
+          'Проблема': { title: [{ text: { content: text } }] },
+          'Категория': { select: { name: 'Команда' } },
+          'Статус': { select: { name: 'Задачи' } },
+          'Критичность': { select: { name: severity } },
+          'Ответственный': { rich_text: [{ text: { content: 'Администратор' } }] },
+          'Срок исполнения': { date: { start: deadline } },
+          'Дата отзыва': { date: { start: venueDateStr() } },
+          'От основателя': { checkbox: true }
+        }
+      })
+    });
+    await sendTelegramMessage(ADMIN_CHAT_ID, `📌 Новая задача от основателя: «${text}»\nСрок: ${deadline}`);
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to create founder task' });
+  }
+});
+
+// Список открытых задач от основателя — виден администратору и основателю
+// (десктопный интерфейс отдаёт их отдельным блоком рядом с "Проблемы")
+app.get('/api/admin/founder-tasks', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_PROBLEMS_DB_ID}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({
+        filter: {
+          and: [
+            { property: 'От основателя', checkbox: { equals: true } },
+            { or: [
+              { property: 'Статус', select: { equals: 'Задачи' } },
+              { property: 'Статус', select: { equals: 'В работе' } }
+            ]}
+          ]
+        },
+        sorts: [{ property: 'Срок исполнения', direction: 'ascending' }]
+      })
+    });
+    const data = await r.json();
+    const tasks = (data.results || []).map(p => {
+      const props = p.properties;
+      return {
+        id: p.id,
+        text: props['Проблема']?.title?.[0]?.plain_text || '',
+        status: props['Статус']?.select?.name || '',
+        severity: props['Критичность']?.select?.name || '',
+        deadline: props['Срок исполнения']?.date?.start || ''
+      };
+    });
+    res.json(tasks);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch founder tasks' });
+  }
+});
+
+// Взять в работу / закрыть — доступно и администратору, и основателю.
+// В отличие от гостевых "Проблем" тут не требуется указывать коренную причину —
+// это внутренняя задача, а не разбор жалобы.
+app.post('/api/founder/task/:id/take', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
+      method: 'PATCH',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ properties: { 'Статус': { select: { name: 'В работе' } } } })
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to update founder task' });
+  }
+});
+
+app.post('/api/founder/task/:id/resolve', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
+      method: 'PATCH',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ properties: { 'Статус': { select: { name: 'Решена' } } } })
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to resolve founder task' });
+  }
 });
 
 // ─── eNPS ОТ СОТРУДНИКОВ — АНОНИМНО ─────────────────
