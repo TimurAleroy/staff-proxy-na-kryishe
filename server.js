@@ -17,6 +17,7 @@ const NOTION_GENERAL_GUESTS_DB_ID = 'f25cd3eb7e8441f2ada6bdd20700c4d6'; // Об�
 const NOTION_EMPLOYEES_DB_ID = '56fb72e9a9244998828c1d8d3cb9b381'; // Сотрудники — именные PIN-коды
 const NOTION_SCHEDULE_DB_ID = '34d1765f8cd64ed0abc3838096a22066'; // График смен — замена Supershift
 const NOTION_MENU_DB_ID = '4640c3e50a71422e8d61830c060f52c8'; // Меню — тот же источник, что и в гостевом приложении
+const NOTION_TASKS_DB_ID = '2d474599285842179e7bd99d9b8e3207'; // Задачи — отдельный простой задачник от основателя
 
 // "Основатель" — роль-надстройка над "Администратор": видит и может всё то же самое
 // в десктопном интерфейсе, плюс дополнительно может ставить задачи (см. /api/founder/*
@@ -201,6 +202,47 @@ async function checkOverdueProblems() {
 
 setInterval(checkOverdueProblems, 6 * 60 * 60 * 1000); // каждые 6 часов
 setTimeout(checkOverdueProblems, 30 * 1000); // и один раз вскоре после старта сервера
+
+// То же самое, но для отдельного задачника основателя — просроченным считается
+// незавершённая задача (Готово=false) со сроком раньше сегодняшнего дня.
+// Срок необязателен, поэтому задачи без срока сюда никогда не попадают.
+const remindedTasksToday = new Set(); // "taskId_YYYY-MM-DD"
+
+async function checkOverdueFounderTasks() {
+  try {
+    const today = venueDateStr();
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_TASKS_DB_ID}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({
+        filter: {
+          and: [
+            { property: 'Готово', checkbox: { equals: false } },
+            { property: 'Срок', date: { before: today } }
+          ]
+        }
+      })
+    });
+    const data = await r.json();
+
+    for (const page of data.results || []) {
+      const key = `${page.id}_${today}`;
+      if (remindedTasksToday.has(key)) continue;
+
+      const props = page.properties;
+      const title = props['Задача']?.title?.[0]?.plain_text || 'Задача';
+      const deadline = props['Срок']?.date?.start || '';
+
+      await sendTelegramMessage(ADMIN_CHAT_ID, `⏰ Просрочена задача от основателя: «${title}»\nСрок был: ${deadline}\n\nОтметьте готовой или обновите срок в приложении.`);
+      remindedTasksToday.add(key);
+    }
+  } catch (err) {
+    console.error('Overdue founder tasks check failed:', err);
+  }
+}
+
+setInterval(checkOverdueFounderTasks, 6 * 60 * 60 * 1000); // каждые 6 часов
+setTimeout(checkOverdueFounderTasks, 30 * 1000); // и один раз вскоре после старта сервера
 
 async function tgApi(method, payload) {
   if (!TELEGRAM_BOT_TOKEN) return null;
@@ -1169,12 +1211,10 @@ app.get('/api/staff/assignable-roles', async (req, res) => {
 });
 
 // ─── ОСНОВАТЕЛЬ: ЗАДАЧИ АДМИНУ ───────────────────────
-// Отдельная лёгкая надстройка над той же базой "Проблемы" — задача от основателя
-// это обычная строка в ней (с флагом "От основателя"), поэтому переиспользует уже
-// готовые статусы (Задачи → В работе → Решена) и напоминания об просрочке
-// (см. checkOverdueProblems выше — он проверяет всю базу, включая эти строки).
-// В десктопном интерфейсе админа они показываются отдельным блоком, а не вперемешку
-// с гостевыми проблемами.
+// Простой отдельный задачник — своя база "Задачи" в Notion (NOTION_TASKS_DB_ID),
+// никак не связанная с "Проблемы". Никаких категорий/приоритетов/промежуточных
+// статусов — только текст задачи, необязательный срок и галочка "Готово".
+// В десктопном интерфейсе админа показывается отдельным блоком.
 
 // Поставить задачу может только сама роль "Основатель" — это её единственная
 // дополнительная возможность сверх обычного администратора.
@@ -1186,29 +1226,23 @@ app.post('/api/founder/task', async (req, res) => {
   }
 
   const text = (req.body?.text || '').trim();
-  const severity = req.body?.severity || 'Средняя';
-  const deadline = (req.body?.deadline || '').trim() || defaultDeadline(severity);
+  const deadline = (req.body?.deadline || '').trim();
   if (!text) return res.status(400).json({ error: 'Укажите текст задачи' });
+
+  const properties = {
+    'Задача': { title: [{ text: { content: text } }] },
+    'Готово': { checkbox: false },
+    'Создано': { date: { start: venueDateStr() } }
+  };
+  if (deadline) properties['Срок'] = { date: { start: deadline } };
 
   try {
     await fetch('https://api.notion.com/v1/pages', {
       method: 'POST',
       headers: NOTION_HEADERS,
-      body: JSON.stringify({
-        parent: { database_id: NOTION_PROBLEMS_DB_ID },
-        properties: {
-          'Проблема': { title: [{ text: { content: text } }] },
-          'Категория': { select: { name: 'Команда' } },
-          'Статус': { select: { name: 'Задачи' } },
-          'Критичность': { select: { name: severity } },
-          'Ответственный': { rich_text: [{ text: { content: 'Администратор' } }] },
-          'Срок исполнения': { date: { start: deadline } },
-          'Дата отзыва': { date: { start: venueDateStr() } },
-          'От основателя': { checkbox: true }
-        }
-      })
+      body: JSON.stringify({ parent: { database_id: NOTION_TASKS_DB_ID }, properties })
     });
-    await sendTelegramMessage(ADMIN_CHAT_ID, `📌 Новая задача от основателя: «${text}»\nСрок: ${deadline}`);
+    await sendTelegramMessage(ADMIN_CHAT_ID, `📌 Новая задача от основателя: «${text}»${deadline ? `\nСрок: ${deadline}` : ''}`);
     res.json({ ok: true });
   } catch (error) {
     console.error(error);
@@ -1216,25 +1250,17 @@ app.post('/api/founder/task', async (req, res) => {
   }
 });
 
-// Список открытых задач от основателя — виден администратору и основателю
+// Список незавершённых задач — виден администратору и основателю
 // (десктопный интерфейс отдаёт их отдельным блоком рядом с "Проблемы")
 app.get('/api/admin/founder-tasks', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
   try {
-    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_PROBLEMS_DB_ID}/query`, {
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_TASKS_DB_ID}/query`, {
       method: 'POST',
       headers: NOTION_HEADERS,
       body: JSON.stringify({
-        filter: {
-          and: [
-            { property: 'От основателя', checkbox: { equals: true } },
-            { or: [
-              { property: 'Статус', select: { equals: 'Задачи' } },
-              { property: 'Статус', select: { equals: 'В работе' } }
-            ]}
-          ]
-        },
-        sorts: [{ property: 'Срок исполнения', direction: 'ascending' }]
+        filter: { property: 'Готово', checkbox: { equals: false } },
+        sorts: [{ property: 'Создано', direction: 'descending' }]
       })
     });
     const data = await r.json();
@@ -1242,10 +1268,9 @@ app.get('/api/admin/founder-tasks', async (req, res) => {
       const props = p.properties;
       return {
         id: p.id,
-        text: props['Проблема']?.title?.[0]?.plain_text || '',
-        status: props['Статус']?.select?.name || '',
-        severity: props['Критичность']?.select?.name || '',
-        deadline: props['Срок исполнения']?.date?.start || ''
+        text: props['Задача']?.title?.[0]?.plain_text || '',
+        done: props['Готово']?.checkbox || false,
+        deadline: props['Срок']?.date?.start || ''
       };
     });
     res.json(tasks);
@@ -1255,36 +1280,21 @@ app.get('/api/admin/founder-tasks', async (req, res) => {
   }
 });
 
-// Взять в работу / закрыть — доступно и администратору, и основателю.
-// В отличие от гостевых "Проблем" тут не требуется указывать коренную причину —
-// это внутренняя задача, а не разбор жалобы.
-app.post('/api/founder/task/:id/take', async (req, res) => {
+// Отметить готово / вернуть в работу — просто переключатель галочки "Готово".
+// Доступно и администратору, и основателю.
+app.post('/api/founder/task/:id/done', async (req, res) => {
   if (!(await checkAdminPin(req, res))) return;
+  const done = req.body?.done !== false; // по умолчанию true — отметить готовой
   try {
     await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
       method: 'PATCH',
       headers: NOTION_HEADERS,
-      body: JSON.stringify({ properties: { 'Статус': { select: { name: 'В работе' } } } })
+      body: JSON.stringify({ properties: { 'Готово': { checkbox: done } } })
     });
     res.json({ ok: true });
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to update founder task' });
-  }
-});
-
-app.post('/api/founder/task/:id/resolve', async (req, res) => {
-  if (!(await checkAdminPin(req, res))) return;
-  try {
-    await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
-      method: 'PATCH',
-      headers: NOTION_HEADERS,
-      body: JSON.stringify({ properties: { 'Статус': { select: { name: 'Решена' } } } })
-    });
-    res.json({ ok: true });
-  } catch (error) {
-    console.error(error);
-    res.status(500).json({ error: 'Failed to resolve founder task' });
   }
 });
 
