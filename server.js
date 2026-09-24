@@ -18,6 +18,7 @@ const NOTION_EMPLOYEES_DB_ID = '56fb72e9a9244998828c1d8d3cb9b381'; // Сотру
 const NOTION_SCHEDULE_DB_ID = '34d1765f8cd64ed0abc3838096a22066'; // График смен — замена Supershift
 const NOTION_MENU_DB_ID = '4640c3e50a71422e8d61830c060f52c8'; // Меню — тот же источник, что и в гостевом приложении
 const NOTION_TASKS_DB_ID = '2d474599285842179e7bd99d9b8e3207'; // Задачи — отдельный простой задачник от основателя
+const NOTION_NOTES_DB_ID = 'd83da7a092194dcb80c3f1732acc902e'; // Заметки — быстрые записи админа/основателя вместо бумажек
 
 // "Основатель" — роль-надстройка над "Администратор": видит и может всё то же самое
 // в десктопном интерфейсе, плюс дополнительно может ставить задачи (см. /api/founder/*
@@ -1298,6 +1299,83 @@ app.post('/api/founder/task/:id/done', async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ error: 'Failed to update founder task' });
+  }
+});
+
+// ─── ЗАМЕТКИ — быстрые записи админа/основателя вместо бумажек ─────
+// Своя база "Заметки" в Notion (NOTION_NOTES_DB_ID), никак не связана с
+// "Задачи"/"Проблемы". Только текст и автор — никаких статусов/сроков,
+// это буквально стикер: записал — потом сам стёр, когда разобрался.
+// Видно и доступно и администратору, и основателю (isAdminRole), в
+// отличие от "Задачи" (там ставить может только основатель) — любой
+// админ на смене может быстро что-то себе черкнуть.
+
+app.post('/api/admin/note', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  const employee = req.employee;
+  const text = (req.body?.text || '').trim();
+  if (!text) return res.status(400).json({ error: 'Укажите текст заметки' });
+
+  try {
+    await fetch('https://api.notion.com/v1/pages', {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({
+        parent: { database_id: NOTION_NOTES_DB_ID },
+        properties: {
+          'Текст': { title: [{ text: { content: text } }] },
+          'Автор': { rich_text: [{ text: { content: employee.name || '' } }] }
+        }
+      })
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to create note' });
+  }
+});
+
+// Последние заметки, самые новые — сверху. Сортируем по встроенному
+// времени создания страницы в Notion — своего отдельного поля с датой
+// заводить не нужно (в отличие от "Задачи", где важен был "Срок").
+app.get('/api/admin/notes', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    const r = await fetch(`https://api.notion.com/v1/databases/${NOTION_NOTES_DB_ID}/query`, {
+      method: 'POST',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({
+        sorts: [{ timestamp: 'created_time', direction: 'descending' }],
+        page_size: 30
+      })
+    });
+    const data = await r.json();
+    const notes = (data.results || []).map(p => ({
+      id: p.id,
+      text: p.properties['Текст']?.title?.[0]?.plain_text || '',
+      author: p.properties['Автор']?.rich_text?.[0]?.plain_text || ''
+    }));
+    res.json(notes);
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to fetch notes' });
+  }
+});
+
+// Удалить заметку (архивируем в Notion — их аналог удаления) — разобрались,
+// записали куда нужно или сделали — стираем стикер.
+app.delete('/api/admin/note/:id', async (req, res) => {
+  if (!(await checkAdminPin(req, res))) return;
+  try {
+    await fetch(`https://api.notion.com/v1/pages/${req.params.id}`, {
+      method: 'PATCH',
+      headers: NOTION_HEADERS,
+      body: JSON.stringify({ archived: true })
+    });
+    res.json({ ok: true });
+  } catch (error) {
+    console.error(error);
+    res.status(500).json({ error: 'Failed to delete note' });
   }
 });
 
